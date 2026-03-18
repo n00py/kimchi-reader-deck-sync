@@ -1,0 +1,6 @@
+{
+  "mature_interval_days": 21,
+  "max_korean_tokens": 2,
+  "kimchi_lemmatize_batch_size": 500,
+  "kimchi_status_batch_size": 500
+}
