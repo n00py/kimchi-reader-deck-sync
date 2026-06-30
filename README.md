@@ -16,6 +16,7 @@ The add-on adds a new menu action:
 - Skips sentence-like entries and unsupported note shapes instead of guessing.
 - Uses Kimchi Reader's lemmatizer before submitting any word status changes.
 - Filters out words that are already marked in Kimchi Reader.
+- Maintains a local SQLite sync cache of expressions that were already confirmed as `Seen` or `Known`, so repeat syncs can skip a lot of lemmatization work.
 - Shows a preview of pending changes before any write happens.
 - Shows a styled results dialog with the words that actually changed.
 
@@ -105,6 +106,8 @@ The add-on writes runtime state under `user_files/`:
   - saved Kimchi auth tokens and login state
 - `kimchi_invalid_words.json`
   - words Kimchi rejected previously
+- `kimchi_sync_cache.sqlite3`
+  - local expression-status cache used to speed up repeat syncs
 - `runs/<timestamp>/`
   - audit artifacts for each sync run
 
@@ -126,6 +129,7 @@ Before distributing the add-on, remove:
 - `*.pyc`
 - `user_files/state.json`
 - `user_files/kimchi_invalid_words.json`
+- `user_files/kimchi_sync_cache.sqlite3`
 - `user_files/runs/`
 
 ## Notes

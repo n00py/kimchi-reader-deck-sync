@@ -575,6 +575,9 @@ class SyncPreviewDialog(QDialog):
             build_metric_chip("Seen", str(len(preview.pending_seen_words)), card)
         )
         metrics_row.addWidget(
+            build_metric_chip("Local Cache", str(preview.total_cached_expressions), card)
+        )
+        metrics_row.addWidget(
             build_metric_chip("Already Marked", str(preview.total_already_marked), card)
         )
         metrics_row.addWidget(

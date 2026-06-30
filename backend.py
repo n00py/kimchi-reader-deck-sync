@@ -28,6 +28,7 @@ KIMCHI_STATUS_BULK_LIMIT = 500
 KIMCHI_HISTORY_PAGE_LIMIT = 5000
 STATE_FILE_NAME = "state.json"
 INVALID_WORD_CACHE_FILE_NAME = "kimchi_invalid_words.json"
+SYNC_CACHE_DB_FILE_NAME = "kimchi_sync_cache.sqlite3"
 RUNS_DIR_NAME = "runs"
 COLLECTION_FILE_NAMES = ("collection.anki21", "collection.anki2")
 
@@ -154,10 +155,12 @@ class ImportStepResult:
 class PreviewStepResult:
     status: str
     expression_count: int
+    cached_expression_count: int
     resolved_word_count: int
     already_marked_count: int
     cached_invalid_count: int
     pending_words: Tuple[str, ...] = ()
+    expression_word_pairs: Tuple[Tuple[str, str], ...] = ()
     details: Optional[str] = None
 
 
@@ -184,6 +187,10 @@ class SyncPreview:
     @property
     def total_pending_words(self) -> int:
         return len(self.pending_seen_words) + len(self.pending_known_words)
+
+    @property
+    def total_cached_expressions(self) -> int:
+        return sum(step.cached_expression_count for step in self.steps)
 
     @property
     def total_already_marked(self) -> int:
@@ -291,6 +298,41 @@ def extract_words_from_lemmatize_entry(entry: object) -> Tuple[str, ...]:
             seen.add(selected)
             words.append(selected)
     return tuple(words)
+
+
+def filter_expressions_by_cached_status(
+    expressions: Sequence[str],
+    target_status: str,
+    cached_statuses: Dict[str, int],
+) -> Tuple[Tuple[str, ...], int]:
+    pending = []
+    cached_count = 0
+    target_value = target_status_value(target_status)
+
+    for expression in expressions:
+        if cached_statuses.get(expression, 0) >= target_value:
+            cached_count += 1
+            continue
+        pending.append(expression)
+
+    return tuple(pending), cached_count
+
+
+def expressions_for_words(
+    expression_word_pairs: Sequence[Tuple[str, str]],
+    words: Iterable[str],
+) -> Tuple[str, ...]:
+    wanted = set(words)
+    expressions = []
+    seen = set()
+
+    for expression, word in expression_word_pairs:
+        if word not in wanted or expression in seen:
+            continue
+        seen.add(expression)
+        expressions.append(expression)
+
+    return tuple(expressions)
 
 
 def extract_words_from_lemmatize_response(payload: object) -> Tuple[str, ...]:
@@ -745,6 +787,89 @@ class LocalStateStore:
         self.save(state)
 
 
+class LocalSyncCache:
+    def __init__(self, cache_path: Path):
+        self.cache_path = cache_path
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def _initialize(self) -> None:
+        with self._connect() as con:
+            con.execute(
+                """
+                create table if not exists expression_status (
+                    expression text primary key,
+                    status integer not null,
+                    word text,
+                    updated_at text not null
+                )
+                """
+            )
+
+    def get_expression_statuses(self, expressions: Sequence[str]) -> Dict[str, int]:
+        if not expressions:
+            return {}
+
+        statuses = {}
+        with self._connect() as con:
+            for chunk in self._chunked(expressions, 500):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = con.execute(
+                    """
+                    select expression, status
+                    from expression_status
+                    where expression in (%s)
+                    """
+                    % placeholders,
+                    tuple(chunk),
+                ).fetchall()
+                for row in rows:
+                    statuses[str(row["expression"])] = int(row["status"])
+        return statuses
+
+    def upsert_expression_statuses(
+        self,
+        expression_statuses: Dict[str, Tuple[int, Optional[str]]],
+    ) -> None:
+        if not expression_statuses:
+            return
+
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        rows = [
+            (expression, int(status), word, timestamp)
+            for expression, (status, word) in expression_statuses.items()
+        ]
+        with self._connect() as con:
+            con.executemany(
+                """
+                insert into expression_status (expression, status, word, updated_at)
+                values (?, ?, ?, ?)
+                on conflict(expression) do update set
+                    status=excluded.status,
+                    word=excluded.word,
+                    updated_at=excluded.updated_at
+                where excluded.status >= expression_status.status
+                """,
+                rows,
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(str(self.cache_path))
+        con.row_factory = sqlite3.Row
+        return con
+
+    @staticmethod
+    def _chunked(values: Sequence[str], size: int) -> Iterator[Tuple[str, ...]]:
+        chunk = []
+        for value in values:
+            chunk.append(value)
+            if len(chunk) >= size:
+                yield tuple(chunk)
+                chunk = []
+        if chunk:
+            yield tuple(chunk)
+
+
 class KimchiAuthManager:
     def __init__(self, user_files_dir: Path):
         self.store = LocalStateStore(user_files_dir)
@@ -1020,6 +1145,7 @@ class KimchiSyncBackend:
         self.settings = settings or SyncSettings()
         self.auth = KimchiAuthManager(user_files_dir)
         self.invalid_word_cache_path = user_files_dir / INVALID_WORD_CACHE_FILE_NAME
+        self.sync_cache = LocalSyncCache(user_files_dir / SYNC_CACHE_DB_FILE_NAME)
         self.artifacts_root = user_files_dir / RUNS_DIR_NAME
 
     def authenticate_with_otp(self, email: str, auth_code: str) -> None:
@@ -1040,9 +1166,11 @@ class KimchiSyncBackend:
             raise KimchiAddonError("Kimchi login is required before syncing.")
 
         plan = self._build_plan(selected_decks)
-        current_statuses = self._load_current_statuses(access_token)
+        cached_expression_statuses = self.sync_cache.get_expression_statuses(plan.seen_expressions + plan.known_expressions)
+        current_statuses = None
         invalid_word_cache = self._load_invalid_word_cache()
         steps = []
+        cache_updates = {}
 
         for status, expressions in (
             ("seen", plan.seen_expressions),
@@ -1053,38 +1181,81 @@ class KimchiSyncBackend:
                     PreviewStepResult(
                         status=status,
                         expression_count=0,
+                        cached_expression_count=0,
                         resolved_word_count=0,
                         already_marked_count=0,
                         cached_invalid_count=0,
                         details="No expressions to import.",
                         pending_words=(),
+                        expression_word_pairs=(),
                     )
                 )
                 continue
 
-            words = self._resolve_words(expressions, access_token)
-            filtered_words = self._filter_existing_words(words, status, current_statuses)
+            uncached_expressions, cached_expression_count = filter_expressions_by_cached_status(
+                expressions,
+                status,
+                cached_expression_statuses,
+            )
+
+            if not uncached_expressions:
+                steps.append(
+                    PreviewStepResult(
+                        status=status,
+                        expression_count=len(expressions),
+                        cached_expression_count=cached_expression_count,
+                        resolved_word_count=0,
+                        already_marked_count=0,
+                        cached_invalid_count=0,
+                        details=(
+                            "Skipped %d expression(s) using the local sync cache."
+                            % cached_expression_count
+                        ),
+                        pending_words=(),
+                        expression_word_pairs=(),
+                    )
+                )
+                continue
+
+            words, expression_word_pairs = self._resolve_words(uncached_expressions, access_token)
+            if current_statuses is None and words:
+                current_statuses = self._load_current_statuses(access_token)
+            filtered_words = self._filter_existing_words(words, status, current_statuses or {})
             skipped_existing = len(words) - len(filtered_words)
             filtered_invalid_cache = self._filter_invalid_cache_words(
                 filtered_words,
                 invalid_word_cache,
             )
             skipped_cached_invalid = len(filtered_words) - len(filtered_invalid_cache)
+            already_marked_expressions = expressions_for_words(
+                expression_word_pairs,
+                set(words) - set(filtered_words),
+            )
+            for expression in already_marked_expressions:
+                word = dict(expression_word_pairs).get(expression)
+                cache_updates[expression] = (target_status_value(status), word)
 
             if not filtered_invalid_cache:
                 steps.append(
                     PreviewStepResult(
                         status=status,
                         expression_count=len(expressions),
+                        cached_expression_count=cached_expression_count,
                         resolved_word_count=len(words),
                         already_marked_count=skipped_existing,
                         cached_invalid_count=skipped_cached_invalid,
                         details=(
                             "No Kimchi words need submission for this batch. "
-                            "Filtered out %d already-marked word(s) and %d cached invalid word(s)."
-                            % (skipped_existing, skipped_cached_invalid)
+                            "Skipped %d expression(s) using the local sync cache, filtered out %d already-marked word(s), "
+                            "and filtered out %d cached invalid word(s)."
+                            % (
+                                cached_expression_count,
+                                skipped_existing,
+                                skipped_cached_invalid,
+                            )
                         ),
                         pending_words=(),
+                        expression_word_pairs=tuple(expression_word_pairs),
                     )
                 )
                 continue
@@ -1093,14 +1264,16 @@ class KimchiSyncBackend:
                 PreviewStepResult(
                     status=status,
                     expression_count=len(expressions),
+                    cached_expression_count=cached_expression_count,
                     resolved_word_count=len(words),
                     already_marked_count=skipped_existing,
                     cached_invalid_count=skipped_cached_invalid,
                     details=(
-                        "Lemmatized %d expression(s) to %d Kimchi word(s), filtered out %d already-marked word(s), "
+                        "Skipped %d expression(s) using the local sync cache, lemmatized %d expression(s) to %d Kimchi word(s), filtered out %d already-marked word(s), "
                         "filtered out %d cached invalid word(s), and prepared %d pending word(s)."
                         % (
-                            len(expressions),
+                            cached_expression_count,
+                            len(uncached_expressions),
                             len(words),
                             skipped_existing,
                             skipped_cached_invalid,
@@ -1108,9 +1281,11 @@ class KimchiSyncBackend:
                         )
                     ),
                     pending_words=tuple(filtered_invalid_cache),
+                    expression_word_pairs=tuple(expression_word_pairs),
                 )
             )
 
+        self.sync_cache.upsert_expression_statuses(cache_updates)
         return SyncPreview(
             selected_decks=tuple(selected_decks),
             plan=plan,
@@ -1126,6 +1301,7 @@ class KimchiSyncBackend:
         current_statuses = self._load_current_statuses(access_token)
         invalid_word_cache = self._load_invalid_word_cache()
         steps = []
+        cache_updates = {}
 
         for preview_step in preview.steps:
             status = preview_step.status
@@ -1140,6 +1316,16 @@ class KimchiSyncBackend:
                 invalid_word_cache,
             )
             skipped_cached_invalid = len(words) - len(filtered_invalid_cache)
+            expression_word_map = dict(preview_step.expression_word_pairs)
+            already_marked_expressions = expressions_for_words(
+                preview_step.expression_word_pairs,
+                set(preview_step.pending_words) - set(words),
+            )
+            for expression in already_marked_expressions:
+                cache_updates[expression] = (
+                    target_status_value(status),
+                    expression_word_map.get(expression),
+                )
 
             if not filtered_invalid_cache:
                 steps.append(
@@ -1170,6 +1356,14 @@ class KimchiSyncBackend:
             submitted_count = len(submitted_words)
             for word in submitted_words:
                 current_statuses[word] = target_status_value(status)
+            for expression in expressions_for_words(
+                preview_step.expression_word_pairs,
+                submitted_words,
+            ):
+                cache_updates[expression] = (
+                    target_status_value(status),
+                    expression_word_map.get(expression),
+                )
 
             steps.append(
                 ImportStepResult(
@@ -1190,6 +1384,7 @@ class KimchiSyncBackend:
             )
 
         self._save_invalid_word_cache(invalid_word_cache)
+        self.sync_cache.upsert_expression_statuses(cache_updates)
         artifacts_dir = write_sync_artifacts(plan, tuple(steps), self.artifacts_root)
         return SyncRunResult(
             selected_decks=preview.selected_decks,
@@ -1212,9 +1407,10 @@ class KimchiSyncBackend:
         self,
         expressions: Sequence[str],
         access_token: str,
-    ) -> Tuple[str, ...]:
+    ) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, str], ...]]:
         words = []
         seen = set()
+        expression_word_pairs = []
         chunks = tuple(self._chunked(expressions, self.settings.kimchi_lemmatize_batch_size))
 
         for chunk in chunks:
@@ -1226,13 +1422,17 @@ class KimchiSyncBackend:
                 expected_statuses=(200,),
             )
             response_items = payload.get("items", [])
-            for word in extract_words_from_lemmatize_response(response_items):
-                if word in seen:
-                    continue
-                seen.add(word)
-                words.append(word)
+            for expression, entry in zip(chunk, response_items):
+                entry_words = extract_words_from_lemmatize_entry(entry)
+                if len(entry_words) == 1:
+                    expression_word_pairs.append((expression, entry_words[0]))
+                for word in entry_words:
+                    if word in seen:
+                        continue
+                    seen.add(word)
+                    words.append(word)
 
-        return tuple(words)
+        return tuple(words), tuple(expression_word_pairs)
 
     def _load_current_statuses(self, access_token: str) -> Dict[str, int]:
         statuses = {}
