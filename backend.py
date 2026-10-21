@@ -456,7 +456,8 @@ class CollectionSnapshotSource:
             decks = self._load_decks(con)
             models = self._load_models(con)
             deck_name_to_id = dict(
-                (deck["name"], int(deck_id)) for deck_id, deck in decks.items()
+                (self._display_deck_name(deck["name"]), int(deck_id))
+                for deck_id, deck in decks.items()
             )
             missing = [name for name in deck_names if name not in deck_name_to_id]
             if missing:
@@ -489,7 +490,7 @@ class CollectionSnapshotSource:
                     SourceCard(
                         card_id=int(row["cid"]),
                         note_id=int(row["nid"]),
-                        deck_name=decks[str(row["did"])]["name"],
+                        deck_name=self._display_deck_name(decks[str(row["did"])]["name"]),
                         model_name=model["name"],
                         fields=dict(zip(field_names, field_values)),
                         interval=int(row["ivl"]),
@@ -538,6 +539,11 @@ class CollectionSnapshotSource:
             return sqlite3.connect(uri, uri=True)
         except sqlite3.Error:
             return sqlite3.connect(str(resolved))
+
+    @staticmethod
+    def _display_deck_name(name: str) -> str:
+        """Match the :: names returned by Anki's deck picker on modern schemas."""
+        return name.replace("\x1f", "::")
 
     @staticmethod
     def _load_decks(con: sqlite3.Connection) -> Dict[str, Dict[str, object]]:
